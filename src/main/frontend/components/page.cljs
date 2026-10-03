@@ -140,6 +140,7 @@
   [page option document-mode?]
   (merge {:id (str (:block/uuid page))
           :db/id (:db/id page)
+          :current-page-title (:block/title page)
           :block? (not (entity/page? page))
           :editor-box editor/box
           :document/mode? document-mode?
@@ -682,7 +683,9 @@
        :page (cond-> page
                breadcrumb-key
                (assoc :block.temp/breadcrumb
-                      (breadcrumb-model/resource-ancestors breadcrumb-data)))})))
+                      (breadcrumb-model/resource-ancestors breadcrumb-data)
+                      :block.temp/breadcrumb-ref-titles
+                      (:ref-titles breadcrumb-data)))})))
 
 (hsx/defc page-aux
   [option {:keys [status page]}]

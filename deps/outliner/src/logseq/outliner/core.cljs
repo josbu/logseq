@@ -81,13 +81,27 @@
     (assoc block :block/updated-at updated-at)))
 
 (defn- filter-top-level-blocks
-  [db blocks]
-  (let [parent-ids (set/intersection (set (map (comp :db/id :block/parent) blocks))
-                                     (set (map :db/id blocks)))]
-    (->> blocks
-         (remove (fn [e] (contains? parent-ids (:db/id (:block/parent e)))))
-         (map (fn [block]
-                (if (de/entity? block) block (d/entity db (:db/id block))))))))
+  ([db blocks]
+   (filter-top-level-blocks db blocks (constantly true)))
+  ([db blocks cover-ancestor?]
+   (let [blocks (map (fn [block]
+                       (if (de/entity? block) block (d/entity db (:db/id block))))
+                     blocks)
+         selected-ids (set (keep :db/id blocks))]
+     (remove (fn [block]
+               (ldb/some-parent block
+                                (fn [parent]
+                                  (and (contains? selected-ids (:db/id parent))
+                                       (cover-ancestor? block parent)))))
+             blocks))))
+
+(defn- delete-covers-selected-ancestor?
+  "A selected ancestor covers a block for delete when it is the direct parent
+   (a page parent only detaches, so its selected children must not also be
+   deleted) or a non-page ancestor whose delete retracts the subtree."
+  [block ancestor]
+  (or (= (:db/id ancestor) (:db/id (:block/parent block)))
+      (not (ldb/page? ancestor))))
 
 (defn- remove-orphaned-page-refs!
   [db {db-id :db/id} txs-state old-refs new-refs]
@@ -301,45 +315,80 @@
     [[] {}]
     refs)))
 
-(defn- resolve-page-refs
-  [db block]
-  (if-let [refs (seq (:block/refs block))]
-    (let [tag-names (into #{} (keep :block/name) (:block/tags block))
-          resolved-refs (resolve-refs-dedup db refs tag-names)
-          refs' (mapv first resolved-refs)
-          page-txs (mapcat second resolved-refs)
-          tag-refs (reduce (fn [m ref]
-                             (if (:db/ident ref)
-                               (update m (:block/name ref) (fnil conj []) ref)
-                               m))
-                           {}
-                           refs')
-          tags' (mapv (fn [tag]
-                        (if-let [ref (matching-ref-for-tag tag (get tag-refs (:block/name tag)))]
-                          (merge (dissoc tag :block/type)
-                                 (select-keys ref [:block/uuid :db/ident]))
-                          tag))
-                      (:block/tags block))
-          replacements (keep (fn [[ref ref']]
-                               (when (not= (:block/uuid ref) (:block/uuid ref'))
-                                 [(:block/uuid ref) (:block/uuid ref')]))
-                             (map vector refs refs'))
-          replace-refs (fn [title]
-                         (reduce (fn [title [old-uuid new-uuid]]
-                                   (string/replace title
-                                                   (page-ref/->page-ref old-uuid)
-                                                   (page-ref/->page-ref new-uuid)))
-                                 title
-                                 replacements))]
-      {:block (cond-> (assoc block :block/refs refs'
-                                     :block/tags tags')
-                (and (seq replacements) (string? (:block/title block)))
-                (update :block/title replace-refs)
+(defn- broken-page-map?
+  "A uuid-named page ref that matches no entity resolves to a nil :block/uuid
+  because no page is created for it; the typed [[uuid]] renders as a broken ref."
+  [ref']
+  (and (map? ref')
+       (nil? (:block/uuid ref'))
+       (nil? (:db/id ref'))
+       (nil? (:db/ident ref'))
+       (common-util/uuid-string? (or (:block/name ref') ""))))
 
-                (and (seq replacements) (string? (:block/raw-title block)))
-                (update :block/raw-title replace-refs))
-       :page-txs page-txs})
-    {:block block}))
+(defn- missing-uuid-ref?
+  "A [:block/uuid id] lookup whose entity doesn't exist and isn't created by
+  this transaction would fail the transaction, so it's dropped."
+  [db created-uuids [_ref ref' _tx-data]]
+  (and (vector? ref')
+       (= :block/uuid (first ref'))
+       (uuid? (second ref'))
+       (not (d/entity db [:block/uuid (second ref')]))
+       (not (contains? created-uuids (second ref')))))
+
+(defn- resolve-page-refs
+  ([db block]
+   (resolve-page-refs db block nil))
+  ([db block {:keys [batch-uuids] :or {batch-uuids #{}}}]
+   (if-let [refs (seq (:block/refs block))]
+     (let [tag-names (into #{} (keep :block/name) (:block/tags block))
+           resolved-refs (resolve-refs-dedup db refs tag-names)
+           pairs (mapv (fn [ref [ref' tx-data]] [ref ref' tx-data]) refs resolved-refs)
+           created-uuids (into batch-uuids
+                               (keep (fn [[_ref ref' _tx-data]] (:block/uuid ref')))
+                               pairs)
+           drop-pair? (fn [pair]
+                        (or (broken-page-map? (second pair))
+                            (missing-uuid-ref? db created-uuids pair)))
+           resolved-pairs (into [] (remove drop-pair?) pairs)
+           broken-pairs (filterv (comp broken-page-map? second) pairs)
+           refs' (mapv second resolved-pairs)
+           page-txs (mapcat #(nth % 2) resolved-pairs)
+           tag-refs (reduce (fn [m ref]
+                              (if (:db/ident ref)
+                                (update m (:block/name ref) (fnil conj []) ref)
+                                m))
+                            {}
+                            refs')
+           tags' (mapv (fn [tag]
+                         (if-let [ref (matching-ref-for-tag tag (get tag-refs (:block/name tag)))]
+                           (merge (dissoc tag :block/type)
+                                  (select-keys ref [:block/uuid :db/ident]))
+                           tag))
+                       (:block/tags block))
+           replacements (into (keep (fn [[ref ref' _tx-data]]
+                                      (when (not= (:block/uuid ref) (:block/uuid ref'))
+                                        [(:block/uuid ref) (:block/uuid ref')]))
+                                    resolved-pairs)
+                              (keep (fn [[ref _ref' _tx-data]]
+                                      (when (:block/uuid ref)
+                                        [(:block/uuid ref) (:block/title ref)]))
+                                    broken-pairs))
+           replace-refs (fn [title]
+                          (reduce (fn [title [old-uuid new-uuid]]
+                                    (string/replace title
+                                                    (page-ref/->page-ref old-uuid)
+                                                    (page-ref/->page-ref new-uuid)))
+                                  title
+                                  replacements))]
+       {:block (cond-> (assoc block :block/refs refs'
+                                    :block/tags tags')
+                 (and (seq replacements) (string? (:block/title block)))
+                 (update :block/title replace-refs)
+
+                 (and (seq replacements) (string? (:block/raw-title block)))
+                 (update :block/raw-title replace-refs))
+        :page-txs page-txs})
+     {:block block})))
 
 (defn- remove-tags-when-title-changed
   [block new-content]
@@ -744,7 +793,8 @@
   [db target-block blocks uuids get-new-id {:keys [sibling? outliner-op replace-empty-target? insert-template? keep-block-order?]}]
   (let [block-ids (set (map :block/uuid blocks))
         target-page (get-target-block-page target-block sibling?)
-        orders (get-block-orders blocks target-block sibling? keep-block-order?)]
+        orders (get-block-orders blocks target-block sibling? keep-block-order?)
+        batch-uuids (set (vals uuids))]
     (loop [db db
            idx 0
            blocks blocks
@@ -752,7 +802,7 @@
       (if-let [{:block/keys [parent] :as block} (first blocks)]
         (if-let [uuid' (get uuids (:block/uuid block))]
           (let [{:keys [block page-txs]}
-                (resolve-page-refs db (remove-disallowed-inline-classes db block))
+                (resolve-page-refs db (remove-disallowed-inline-classes db block) {:batch-uuids batch-uuids})
                 top-level? (= (:block/level block) 1)
                 parent (compute-block-parent block parent target-block top-level? sibling? get-new-id outliner-op replace-empty-target? idx)
                 order (nth orders idx)
@@ -787,11 +837,9 @@
                                                :parent parent
                                                :order order
                                                :target-page target-page
-                                               :outliner-op outliner-op})
-                db' (if (seq page-txs)
-                      (:db-after (d/with db page-txs))
-                      db)]
-            (recur db' (inc idx) (rest blocks)
+                                               :outliner-op outliner-op})]
+            (recur (if (seq page-txs) (:db-after (d/with db page-txs)) db)
+                   (inc idx) (rest blocks)
                    (conj entries [(update-property-ref-when-paste result uuids) page-txs])))
           (recur db (inc idx) (rest blocks) (conj entries nil)))
         entries))))
@@ -1227,7 +1275,7 @@
 (defn ^:api ^:large-vars/cleanup-todo delete-blocks
   "Delete blocks from the tree."
   [db blocks _opts]
-  (let [top-level-blocks (filter-top-level-blocks db blocks)
+  (let [top-level-blocks (filter-top-level-blocks db blocks delete-covers-selected-ancestor?)
         non-consecutive? (and (> (count top-level-blocks) 1) (seq (ldb/get-non-consecutive-blocks db top-level-blocks)))
         top-level-blocks* (get-top-level-blocks top-level-blocks non-consecutive?)
         top-level-blocks (remove outliner-validate/built-in-entity? top-level-blocks*)
